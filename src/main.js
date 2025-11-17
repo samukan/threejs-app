@@ -6,16 +6,24 @@ import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
 import {HDRLoader} from 'three/addons/loaders/HDRLoader.js';
 import {VRButton} from 'three/addons/webxr/VRButton.js';
 import {XRControllerModelFactory} from 'three/addons/webxr/XRControllerModelFactory.js';
+import {RapierPhysics} from 'three/addons/physics/RapierPhysics.js';
+import {RapierHelper} from 'three/addons/helpers/RapierHelper.js';
+import Stats from 'three/addons/libs/stats.module.js';
 
 // Globals
-let camera, scene, renderer, controls;
+let camera, scene, renderer, controls, stats;
 let controller1, controller2, controllerGrip1, controllerGrip2;
 let raycaster;
 const intersected = [];
 const tempMatrix = new THREE.Matrix4();
 let group;
+let physics, physicsHelper;
+let teleportMarker;
+const tempVec = new THREE.Vector3();
 
 const excludedObjects = ['maa_2'];
+
+let groundMesh = null; // Store reference to ground for physics
 
 init();
 
@@ -73,7 +81,13 @@ new HDRLoader().setPath(`${ASSET_BASE}equirectangular/textures/`).load(
           }
         });
 
+        groundMesh = ground;
         group.add(ground);
+
+        // Initialize physics after ground is loaded
+        if (physics) {
+          physics.addMesh(ground, 0); // mass 0 = static
+        }
 
         console.log('Ground (maa.glb) loaded with shadows enabled');
         console.log(
@@ -140,7 +154,12 @@ new HDRLoader().setPath(`${ASSET_BASE}equirectangular/textures/`).load(
 
         group.add(model);
 
-        console.log('Bottle loaded with shadows enabled');
+        // Add physics to bottle
+        if (physics) {
+          physics.addMesh(model, 1, 0.3); // mass 1, friction 0.3
+        }
+
+        console.log('Bottle loaded with shadows enabled and physics');
         console.log('Group now has', group.children.length, 'children');
         console.log('Model added to group:', model.name, model.type);
 
@@ -159,7 +178,7 @@ new HDRLoader().setPath(`${ASSET_BASE}equirectangular/textures/`).load(
   }
 );
 
-function init() {
+async function init() {
   // Scene
   scene = new THREE.Scene();
 
@@ -182,6 +201,11 @@ function init() {
   testCube.name = 'TestCube';
   group.add(testCube);
   console.log('Test cube added to group at position:', testCube.position);
+
+  // Add physics to test cube
+  if (physics) {
+    physics.addMesh(testCube, 1, 0.2); // mass 1, friction 0.2
+  }
 
   // Camera
   camera = new THREE.PerspectiveCamera(
@@ -210,6 +234,13 @@ function init() {
   // Enable WebXR on the renderer and add the VR button
   renderer.xr.enabled = true;
   document.body.appendChild(VRButton.createButton(renderer));
+
+  // Initialize Stats
+  stats = new Stats();
+  document.body.appendChild(stats.dom);
+
+  // Initialize physics
+  await initPhysics();
 
   // Listen for VR session start/end
   renderer.xr.addEventListener('sessionstart', () => {
@@ -314,18 +345,145 @@ function init() {
   // Start render loop
   renderer.setAnimationLoop(animate);
 
+  // Setup teleportation
+  setupTeleportation();
+
   // Events
   window.addEventListener('resize', onWindowResize, false);
 }
 
+async function initPhysics() {
+  physics = await RapierPhysics();
+  physics.addScene(scene);
+
+  // Add physics helper for debugging
+  physicsHelper = new RapierHelper(physics.world);
+  scene.add(physicsHelper);
+
+  console.log('Physics initialized');
+}
+
+function setupTeleportation() {
+  // Create teleport marker (a ring/disc on the ground)
+  const markerGeometry = new THREE.RingGeometry(0.25, 0.35, 32);
+  const markerMaterial = new THREE.MeshBasicMaterial({
+    color: 0x00ff00,
+    side: THREE.DoubleSide,
+    transparent: true,
+    opacity: 0.7,
+  });
+  teleportMarker = new THREE.Mesh(markerGeometry, markerMaterial);
+  teleportMarker.rotation.x = -Math.PI / 2; // Lay flat
+  teleportMarker.visible = false;
+  scene.add(teleportMarker);
+
+  // Add squeeze event listeners for teleportation
+  controller1.addEventListener('squeezestart', onSqueezeStart);
+  controller1.addEventListener('squeezeend', onSqueezeEnd);
+  controller2.addEventListener('squeezestart', onSqueezeStart);
+  controller2.addEventListener('squeezeend', onSqueezeEnd);
+
+  console.log('Teleportation system initialized');
+}
+
+function onSqueezeStart(event) {
+  const controller = event.target;
+  controller.userData.teleporting = true;
+  teleportMarker.visible = true;
+  console.log('Teleport mode activated');
+}
+
+function onSqueezeEnd(event) {
+  const controller = event.target;
+  controller.userData.teleporting = false;
+
+  if (teleportMarker.visible && teleportMarker.userData.validLocation) {
+    // Teleport the camera rig
+    const offset = renderer.xr.getCamera().position.clone();
+    offset.y = 0; // Only offset XZ, keep Y
+
+    const newPosition = teleportMarker.position.clone().sub(offset);
+    newPosition.y = camera.position.y; // Maintain current height
+
+    // Move the entire XR reference space
+    const offsetPosition = {
+      x: -newPosition.x,
+      y: -newPosition.y,
+      z: -newPosition.z,
+      w: 1,
+    };
+
+    // Get the base reference space and apply offset
+    const session = renderer.xr.getSession();
+    if (session) {
+      const referenceSpace = renderer.xr.getReferenceSpace();
+      const offsetTransform = new XRRigidTransform(offsetPosition);
+      const newReferenceSpace =
+        referenceSpace.getOffsetReferenceSpace(offsetTransform);
+      renderer.xr.setReferenceSpace(newReferenceSpace);
+      console.log('Teleported to:', teleportMarker.position);
+    }
+  }
+
+  teleportMarker.visible = false;
+  console.log('Teleport mode deactivated');
+}
+
+function updateTeleportMarker(controller) {
+  if (!controller.userData.teleporting) return;
+
+  // Cast ray from controller to find ground
+  controller.updateMatrixWorld();
+  raycaster.setFromXRController(controller);
+
+  // Check intersection with ground
+  const intersects = raycaster.intersectObjects([groundMesh], true);
+
+  if (intersects.length > 0) {
+    const hit = intersects[0];
+    teleportMarker.position.copy(hit.point);
+    teleportMarker.userData.validLocation = true;
+    teleportMarker.material.color.setHex(0x00ff00); // Green for valid
+  } else {
+    teleportMarker.userData.validLocation = false;
+    teleportMarker.material.color.setHex(0xff0000); // Red for invalid
+  }
+}
+
 function animate() {
+  // Remove fallen objects
+  if (physics) {
+    for (let i = group.children.length - 1; i >= 0; i--) {
+      const mesh = group.children[i];
+      if (mesh.position.y < -10) {
+        physics.removeMesh(mesh);
+        group.remove(mesh);
+        scene.remove(mesh);
+        console.log('Removed fallen object:', mesh.name);
+      }
+    }
+  }
+
+  // Update physics helper
+  if (physicsHelper) {
+    physicsHelper.update();
+  }
+
   // Clean previously highlighted objects
   cleanIntersected();
 
-  // Check for intersections
+  // Check for intersections and teleportation
   if (renderer.xr.isPresenting) {
     intersectObjects(controller1);
     intersectObjects(controller2);
+
+    // Update teleport marker if in teleport mode
+    if (controller1.userData.teleporting) {
+      updateTeleportMarker(controller1);
+    }
+    if (controller2.userData.teleporting) {
+      updateTeleportMarker(controller2);
+    }
   }
 
   // update controls
@@ -333,6 +491,11 @@ function animate() {
 
   // render
   renderer.render(scene, camera);
+
+  // update stats
+  if (stats) {
+    stats.update();
+  }
 }
 
 // Helper: get intersections from a controller
@@ -462,11 +625,22 @@ function onSelectStart(event) {
       });
       console.log('Total meshes highlighted:', highlightedCount);
 
+      // Remove from physics while holding
+      if (physics) {
+        physics.removeMesh(rootObject);
+      }
+
+      // Convert hit point to controller local space
+      const localPoint = controller.worldToLocal(
+        tempVec.copy(intersection.point)
+      );
+
       // Attach object to controller (for dragging)
-      controller.attach(rootObject);
+      controller.add(rootObject);
+      rootObject.position.copy(localPoint);
       controller.userData.selected = rootObject;
 
-      console.log('Object attached to controller');
+      console.log('Object attached to controller and removed from physics');
     } else {
       console.log('Object is in exclusion list');
     }
@@ -490,7 +664,15 @@ function onSelectEnd(event) {
       }
     });
 
-    group.attach(object);
+    // Detach back to scene group
+    scene.attach(object);
+    group.add(object);
+
+    // Re-add to physics with new global transform
+    if (physics) {
+      physics.addMesh(object, 1, 0.2);
+    }
+
     controller.userData.selected = undefined;
   }
 }

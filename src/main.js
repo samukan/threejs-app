@@ -16,6 +16,7 @@ const tempMatrix = new THREE.Matrix4();
 let group;
 
 const excludedObjects = ['maa_2'];
+const fallingObjects = [];
 
 init();
 
@@ -41,6 +42,7 @@ new HDRLoader().setPath(`${ASSET_BASE}equirectangular/textures/`).load(
       'maa_2.glb',
       async function (gltf) {
         const ground = gltf.scene;
+        ground.name = 'maa_2';
 
         // Optional precompile
         if (renderer.compileAsync) {
@@ -102,20 +104,36 @@ new HDRLoader().setPath(`${ASSET_BASE}equirectangular/textures/`).load(
           }
         }
 
-        const box = new THREE.Box3().setFromObject(model);
-        const size = box.getSize(new THREE.Vector3());
-        const center = box.getCenter(new THREE.Vector3());
+        // 1. Scale the model first
+        const boxRaw = new THREE.Box3().setFromObject(model);
+        const sizeRaw = boxRaw.getSize(new THREE.Vector3());
+        const maxDim = Math.max(sizeRaw.x, sizeRaw.y, sizeRaw.z);
 
-        // Center the model at origin first
-        model.position.set(-center.x, -box.min.y, -center.z);
-
-        const maxDim = Math.max(size.x, size.y, size.z);
         if (maxDim > 5) {
           const scale = 5 / maxDim;
           model.scale.setScalar(scale);
         }
 
-        model.position.set(0.5, 1.5, -1);
+        // 2. Calculate box of scaled model
+        // We need to update the matrix world to get accurate bounding box after scaling
+        model.updateMatrixWorld(true);
+        const box = new THREE.Box3().setFromObject(model);
+        const center = box.getCenter(new THREE.Vector3());
+
+        // 3. Create a wrapper group
+        const wrapper = new THREE.Group();
+        wrapper.name = 'WaterBottleWrapper';
+
+        // 4. Position model inside wrapper so bottom is at (0,0,0)
+        model.position.x = -center.x;
+        model.position.y = -box.min.y;
+        model.position.z = -center.z;
+        model.name = 'WaterBottleModel';
+
+        wrapper.add(model);
+
+        // 5. Position wrapper in the scene
+        wrapper.position.set(0.5, 1.5, -1);
 
         model.traverse(function (node) {
           if (node.isMesh) {
@@ -138,11 +156,11 @@ new HDRLoader().setPath(`${ASSET_BASE}equirectangular/textures/`).load(
           }
         });
 
-        group.add(model);
+        group.add(wrapper);
 
         console.log('Bottle loaded with shadows enabled');
         console.log('Group now has', group.children.length, 'children');
-        console.log('Model added to group:', model.name, model.type);
+        console.log('Model added to group:', wrapper.name, wrapper.type);
 
         controls.target.set(0, 0, 0);
         controls.update();
@@ -169,6 +187,7 @@ function init() {
 
   // Add a test cube to the group for debugging VR interaction
   const testGeometry = new THREE.BoxGeometry(0.3, 0.3, 0.3);
+  testGeometry.translate(0, 0.15, 0); // Move origin to bottom
   const testMaterial = new THREE.MeshStandardMaterial({
     color: 0xff0000,
     emissive: new THREE.Color(0x000000),
@@ -176,7 +195,7 @@ function init() {
     metalness: 0.0,
   });
   const testCube = new THREE.Mesh(testGeometry, testMaterial);
-  testCube.position.set(0, 1.5, -1); // In front of camera at eye level
+  testCube.position.set(0, 0, -1); // On ground
   testCube.castShadow = true;
   testCube.receiveShadow = true;
   testCube.name = 'TestCube';
@@ -322,6 +341,9 @@ function animate() {
   // Clean previously highlighted objects
   cleanIntersected();
 
+  // Update gravity
+  updateGravity();
+
   // Check for intersections
   if (renderer.xr.isPresenting) {
     intersectObjects(controller1);
@@ -339,18 +361,7 @@ function animate() {
 function getIntersections(controller) {
   controller.updateMatrixWorld();
   raycaster.setFromXRController(controller);
-  const intersections = raycaster.intersectObjects(group.children, true);
-
-  if (intersections.length > 0) {
-    console.log('Found', intersections.length, 'intersections');
-    console.log(
-      'First intersection:',
-      intersections[0].object.name,
-      intersections[0].object.type
-    );
-  }
-
-  return intersections;
+  return raycaster.intersectObjects(group.children, true);
 }
 
 function intersectObjects(controller) {
@@ -369,18 +380,18 @@ function intersectObjects(controller) {
     const intersection = intersections[0];
     let object = intersection.object;
 
-    // Check if object is in exclusion list
-    if (!excludedObjects.includes(object.name)) {
-      // Find the root object in the group
-      let rootObject = object;
-      while (
-        rootObject.parent &&
-        rootObject.parent !== group &&
-        rootObject.parent !== scene
-      ) {
-        rootObject = rootObject.parent;
-      }
+    // Find the root object in the group
+    let rootObject = object;
+    while (
+      rootObject.parent &&
+      rootObject.parent !== group &&
+      rootObject.parent !== scene
+    ) {
+      rootObject = rootObject.parent;
+    }
 
+    // Check if object is in exclusion list
+    if (!excludedObjects.includes(rootObject.name)) {
       // Highlight the root object's meshes
       rootObject.traverse(function (node) {
         if (node.isMesh && node.material && node.material.emissive) {
@@ -416,59 +427,37 @@ function onSelectStart(event) {
     const intersection = intersections[0];
     let object = intersection.object;
 
-    console.log('Intersected object:', object.name, object.type);
-    console.log('Object parent:', object.parent?.name, object.parent?.type);
+    console.log('Select Start: Intersected object:', object.name, object.type);
+
+    // Find the root object in the group
+    let rootObject = object;
+    while (
+      rootObject.parent &&
+      rootObject.parent !== group &&
+      rootObject.parent !== scene
+    ) {
+      rootObject = rootObject.parent;
+    }
+
+    console.log('Select Start: Root object determined:', rootObject.name);
 
     // Check if object is in exclusion list
-    if (!excludedObjects.includes(object.name)) {
-      let rootObject = object;
-      while (
-        rootObject.parent &&
-        rootObject.parent !== group &&
-        rootObject.parent !== scene
-      ) {
-        rootObject = rootObject.parent;
-      }
-
-      console.log('Root object found:', rootObject.name, rootObject.type);
-      console.log(
-        'Root object parent:',
-        rootObject.parent?.name,
-        rootObject.parent?.type
-      );
-
-      let highlightedCount = 0;
-      rootObject.traverse(function (node) {
-        if (node.isMesh) {
-          console.log(
-            'Mesh found:',
-            node.name,
-            'has material:',
-            !!node.material,
-            'has emissive:',
-            !!node.material?.emissive
-          );
-          if (node.material && node.material.emissive) {
-            node.material.emissive.b = 1;
-            highlightedCount++;
-            console.log(
-              'Highlighted mesh:',
-              node.name,
-              'emissive:',
-              node.material.emissive
-            );
-          }
-        }
-      });
-      console.log('Total meshes highlighted:', highlightedCount);
+    if (!excludedObjects.includes(rootObject.name)) {
+      console.log('Select Start: Object is not excluded. Attaching...');
 
       // Attach object to controller (for dragging)
       controller.attach(rootObject);
       controller.userData.selected = rootObject;
 
-      console.log('Object attached to controller');
+      // Remove from falling objects if grabbed
+      const fallingIndex = fallingObjects.indexOf(rootObject);
+      if (fallingIndex !== -1) {
+        fallingObjects.splice(fallingIndex, 1);
+      }
+
+      console.log('Select Start: Object attached to controller');
     } else {
-      console.log('Object is in exclusion list');
+      console.log('Select Start: Object is in exclusion list (maa_2)');
     }
   }
 
@@ -492,6 +481,33 @@ function onSelectEnd(event) {
 
     group.attach(object);
     controller.userData.selected = undefined;
+
+    // Add to falling objects
+    if (!fallingObjects.includes(object)) {
+      fallingObjects.push(object);
+    }
+  }
+}
+
+function updateGravity() {
+  const groundLevel = 0;
+  const gravitySpeed = 0.05;
+
+  for (let i = fallingObjects.length - 1; i >= 0; i--) {
+    const obj = fallingObjects[i];
+
+    if (obj.position.y > groundLevel) {
+      obj.position.y -= gravitySpeed;
+      // Snap if went below ground
+      if (obj.position.y < groundLevel) {
+        obj.position.y = groundLevel;
+        fallingObjects.splice(i, 1);
+      }
+    } else {
+      // Already on ground or below
+      obj.position.y = groundLevel;
+      fallingObjects.splice(i, 1);
+    }
   }
 }
 
